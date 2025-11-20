@@ -10,7 +10,14 @@ import {
   stepCountIs,
   hasToolCall,
 } from "ai";
-
+// In src/ipc/handlers/chat_stream_handlers.ts
+import type { 
+  ChatResponseEnd, 
+  ChatStreamParams, 
+  ComponentSelection, 
+  FileAttachment, 
+  ProblemReport 
+} from "../ipc_types";
 import { db } from "../../db";
 import { chats, messages } from "../../db/schema";
 import { and, eq, isNull } from "drizzle-orm";
@@ -24,7 +31,7 @@ import {
 } from "../../prompts/supabase_prompt";
 import { getDyadAppPath } from "../../paths/paths";
 import { readSettings } from "../../main/settings";
-import type { ChatResponseEnd, ChatStreamParams } from "../ipc_types";
+import { streamChat } from "../../core/ai_service";
 import {
   CodebaseFile,
   extractCodebase,
