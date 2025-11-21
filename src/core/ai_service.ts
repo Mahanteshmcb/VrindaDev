@@ -6,7 +6,7 @@ import type { ChatStreamParams } from "../ipc/ipc_types";
 import { db } from "../db";
 import { messages as messagesTable, apps, chats } from "../db/schema";
 import { getDyadAppPath } from "../paths/paths";
-import { readFileWithCache } from "../utils/codebase";
+import { mcpManager } from "./mcp_manager";
 
 // --- HELPERS ---
 
@@ -16,7 +16,7 @@ function generateFileTree(dir: string, depth = 0, maxDepth = 3): string {
   try {
     const files = fs.readdirSync(dir);
     for (const file of files) {
-      if (["node_modules", ".git", "dist", ".next", ".vscode"].includes(file)) continue;
+      if (["node_modules", ".git", "dist", "build", ".next", ".vscode"].includes(file)) continue;
       const fullPath = path.join(dir, file);
       if (fs.statSync(fullPath).isDirectory()) {
         tree += "  ".repeat(depth) + `📁 ${file}/\n` + generateFileTree(fullPath, depth + 1, maxDepth);
@@ -28,99 +28,30 @@ function generateFileTree(dir: string, depth = 0, maxDepth = 3): string {
   return tree;
 }
 
-function autoDetectFiles(prompt: string, appRoot: string): string[] {
-  const foundFiles: string[] = [];
-  const regex = /[\w\-\/]+\.(ts|tsx|js|jsx|json|css|html|md|py|go|rs)/g;
-  const matches = prompt.match(regex);
-  if (matches) {
-    for (const match of matches) {
-      if (fs.existsSync(path.join(appRoot, match))) foundFiles.push(match);
-    }
-  }
-  return foundFiles;
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- TOOL FORMATTERS ---
+
+function formatToolsOpenAI(tools: any[]) {
+    return tools.map(t => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.inputSchema }
+    }));
 }
 
-// --- GOOGLE GEMINI ADAPTER ---
-
-async function streamGoogle(
-  apiKey: string,
-  model: string,
-  messages: any[],
-  onChunk: (c: string) => void
-) {
-  // Convert OpenAI format messages to Google format
-  // 1. Extract System Prompt
-  let systemInstruction = undefined;
-  const contentHistory = [];
-
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      systemInstruction = { parts: [{ text: msg.content }] };
-    } else {
-      // Google uses 'model' instead of 'assistant'
-      const role = msg.role === "assistant" ? "model" : "user";
-      contentHistory.push({ role, parts: [{ text: msg.content }] });
-    }
-  }
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}`;
-  
-  console.log(`Connecting to Google Gemini (${model})...`);
-  
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: contentHistory,
-      systemInstruction: systemInstruction,
-      generationConfig: { temperature: 0.7 }
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Google API Error: ${await response.text()}`);
-  }
-  if (!response.body) return;
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    
-    // Google sends a JSON array like [{...}, {...}] but sometimes broken across chunks
-    // We need to split by the natural object delimiters or parse safely
-    // Simple hack for Google's specific stream format which usually sends complete JSON objects starting with "data:" or just raw JSON array elements
-    
-    // Clean up buffer to find JSON objects
-    // Note: Google stream format is tricky (comma separated array elements). 
-    // We will try a regex to pull out "text" fields if simple parsing fails.
-    const textMatches = buffer.match(/\"text\":\s*\"(.*?)\"/g);
-    if (textMatches) {
-        for (const match of textMatches) {
-            // Extract content inside quotes and unescape
-            const raw = match.replace('"text": "', "").slice(0, -1);
-            try {
-                const txt = JSON.parse(`"${raw}"`); // Let JSON.parse handle unescaping
-                onChunk(txt);
-            } catch (e) { /* ignore partials */ }
-        }
-        buffer = ""; // Clear buffer after processing
-    }
-  }
+function formatToolsGoogle(tools: any[]) {
+    return [{
+        function_declarations: tools.map(t => {
+            const p = JSON.parse(JSON.stringify(t.inputSchema));
+            if (p.$schema) delete p.$schema;
+            return { name: t.name, description: t.description, parameters: p };
+        })
+    }];
 }
 
 // --- MAIN SERVICE ---
 
-export async function streamChat(
-  params: ChatStreamParams,
-  onChunk: (content: string) => void
-): Promise<void> {
-  console.log("--- STARTING STREAM CHAT ---");
-  
+export async function streamChat(params: ChatStreamParams, onChunk: (content: string) => void): Promise<void> {
   const safeParams = params as any;
   const prompt = safeParams.prompt || "";
   const chatId = safeParams.chatId;
@@ -128,131 +59,221 @@ export async function streamChat(
 
   const settings = await readSettings();
   const safeSettings = settings as any; 
-  
-  // 1. DETERMINE PROVIDER & KEY
-  // We check 'provider' string. It usually is "openai", "google", "anthropic", "ollama", "openrouter"
+  const chatMode = safeSettings.selectedChatMode || "ask"; 
+  const isAgentMode = chatMode === "agent" || chatMode === "build";
+  const autoApprove = safeSettings.autoApproveChanges ?? false; 
+
+  console.log(`--- STARTING CHAT (Mode: ${chatMode}, Auto-Approve: ${autoApprove}) ---`);
+
   const selectedProvider = safeSettings.selectedModel?.provider || "openai";
-  // For Google, model names usually look like "gemini-1.5-flash"
   const selectedModelName = safeSettings.selectedModel?.name || "gpt-4o";
-
   let apiKey = "";
-  
-  // Robust Key Finding
-  if (selectedProvider === "ollama") {
-    apiKey = "ollama"; 
-  } else {
-    // Try new location -> old location -> provider specific fallback
-    apiKey = safeSettings.providerSettings?.[selectedProvider]?.apiKey?.value || 
-             safeSettings.apiKeys?.[selectedProvider] || "";
-             
-    if (!apiKey && selectedProvider === "google") {
-       apiKey = safeSettings.providerSettings?.google?.apiKey?.value || safeSettings.apiKeys?.google;
-    }
+  let providerType = "openai"; 
+
+  if (selectedProvider === "ollama") apiKey = "ollama"; 
+  else {
+    apiKey = safeSettings.providerSettings?.[selectedProvider]?.apiKey?.value || safeSettings.apiKeys?.[selectedProvider] || "";
+    if (!apiKey && selectedProvider === "google") apiKey = safeSettings.providerSettings?.google?.apiKey?.value || safeSettings.apiKeys?.google;
   }
 
-  if (!apiKey) {
-    onChunk(`Error: No API Key found for ${selectedProvider}.`);
-    return;
-  }
+  if (!apiKey) { onChunk(`Error: No API Key found.`); return; }
+  if (selectedProvider === "google" || selectedModelName.startsWith("gemini")) providerType = "google";
 
-  // 2. BUILD CONTEXT
-  let fileContextString = "";
-  let projectMapString = "";
+  let projectContext = "";
+  let appRoot = "";
 
   if (chatId) {
     try {
-      const result = await db.select({ appPath: apps.path, appName: apps.name })
-        .from(chats).innerJoin(apps, eq(chats.appId, apps.id)).where(eq(chats.id, chatId));
+      const result = await db.select({ appPath: apps.path, appName: apps.name }).from(chats)
+        .innerJoin(apps, eq(chats.appId, apps.id)).where(eq(chats.id, chatId));
       
       if (result[0]?.appPath) {
-        const appRoot = getDyadAppPath(result[0].appPath);
-        projectMapString = `\n\n# Project Structure:\n${generateFileTree(appRoot)}\n`;
+        appRoot = getDyadAppPath(result[0].appPath);
         
-        // File Reading
-        const filesToRead = new Set<string>();
-        selectedComponents.forEach((c: any) => c.relativePath && filesToRead.add(c.relativePath));
-        autoDetectFiles(prompt, appRoot).forEach(f => filesToRead.add(f));
+        if (isAgentMode) {
+            try { await mcpManager.connect(appRoot); } catch(e) { console.error("MCP Connect Error", e); }
+        }
 
-        if (filesToRead.size > 0) {
-          fileContextString += "\n\n# File Contents:\n";
-          for (const relPath of filesToRead) {
-            try {
-                const content = fs.readFileSync(path.join(appRoot, relPath), "utf-8");
-                if (content.length < 60000) fileContextString += `\nFile: ${relPath}\n\`\`\`\n${content}\n\`\`\`\n`;
-            } catch (e) { console.error(`Read error: ${relPath}`); }
-          }
+        projectContext += `\n# Project Structure (${result[0].appName}):\n${generateFileTree(appRoot)}\n`;
+        
+        for (const comp of selectedComponents) {
+            if (comp.relativePath) {
+                try {
+                    const content = fs.readFileSync(path.join(appRoot, comp.relativePath), "utf-8");
+                    projectContext += `\nFile: ${comp.relativePath}\n\`\`\`\n${content}\n\`\`\`\n`;
+                } catch(e) {}
+            }
         }
       }
-    } catch (err) { console.error(err); }
+    } catch (err) {}
   }
 
-  const baseSystemPrompt = "You are a coding assistant.";
-  const finalSystemPrompt = `${baseSystemPrompt}${projectMapString}${fileContextString}`;
+  let mcpTools: any[] = [];
+  let toolsPayload: any = undefined;
+  if (isAgentMode && appRoot) {
+      try {
+          const allTools = await mcpManager.listTools();
+          
+          if (autoApprove) {
+              mcpTools = allTools;
+          } else {
+              // Manual Mode: READ ONLY tools
+              mcpTools = allTools.filter(t => !['write_file', 'edit_file', 'execute_command'].includes(t.name));
+          }
+          
+          console.log(`🔧 [Agent] Loaded ${mcpTools.length} tools.`);
+          toolsPayload = providerType === "google" ? formatToolsGoogle(mcpTools) : formatToolsOpenAI(mcpTools);
+      } catch (e) {}
+  }
 
-  const apiMessages = [
-    { role: "system", content: finalSystemPrompt },
-    // Add history logic here if desired (omitted for brevity, same as before)
+  let systemPrompt = "";
+  if (isAgentMode) {
+      if (autoApprove) {
+          systemPrompt = `You are an expert autonomous software engineer.
+          DIRECTIVES:
+          1. IMPLEMENT the user's request IMMEDIATELY using tools.
+          2. Call 'write_file' multiple times in one turn to create all needed files.
+          3. Overwrite existing files if needed.
+          4. Do not ask for permission. Just build it.`;
+      } else {
+          systemPrompt = `You are a coding consultant. MANUAL APPROVAL is ON.
+          INSTRUCTIONS:
+          1. You CANNOT modify files directly (write tools are disabled).
+          2. Output the solution in Markdown code blocks (<dyad-write>) so the user can review.`;
+      }
+  } else {
+      systemPrompt = "You are a helpful coding assistant. Answer questions based on the code context.";
+  }
+
+  let messages: any[] = [
+    { role: "system", content: systemPrompt + projectContext },
     { role: "user", content: prompt }
   ];
 
-  // 3. ROUTE TO CORRECT ADAPTER
-  try {
-    // === GOOGLE / GEMINI CASE ===
-    if (selectedProvider === "google" || selectedModelName.startsWith("gemini")) {
-        await streamGoogle(apiKey, selectedModelName, apiMessages, onChunk);
-        return;
-    }
+  let turnCount = 0;
+  const MAX_TURNS = (isAgentMode && autoApprove) ? 10 : 1;
 
-    // === OPENAI / OPENROUTER / OLLAMA CASE ===
-    let baseUrl = "https://api.openai.com/v1/chat/completions";
-    
-    if (selectedProvider === "ollama") {
-        baseUrl = "http://127.0.0.1:11434/v1/chat/completions";
-    } else if (selectedProvider === "openrouter") {
-        baseUrl = "https://openrouter.ai/api/v1/chat/completions";
-    }
+  while (turnCount < MAX_TURNS) {
+      turnCount++;
+      if (isAgentMode && autoApprove) console.log(`🔄 [Loop] Turn ${turnCount}`);
 
-    console.log(`Connecting to ${baseUrl} (${selectedModelName})...`);
+      try {
+        let responseData: any = null;
+        let attempts = 0;
 
-    const response = await fetch(baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: selectedModelName,
-        messages: apiMessages,
-        temperature: 0.7,
-        stream: true, 
-      }),
-    });
-
-    if (!response.ok) throw new Error(await response.text());
-    if (!response.body) return;
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data: ") && trimmed !== "data: [DONE]") {
+        while (attempts < 3 && !responseData) {
             try {
-                const json = JSON.parse(trimmed.slice(6));
-                const content = json.choices?.[0]?.delta?.content || json.message?.content;
-                if (content) onChunk(content);
-            } catch (e) {}
-        }
-      }
-    }
+                attempts++;
+                if (providerType === "google") {
+                    const contents = messages.filter(m => m.role !== "system").map(m => {
+                        let role = "user";
+                        let text = "";
+                        if (m.role === "assistant") { role = "model"; text = m.content || ""; }
+                        else if (m.role === "tool") { role = "user"; text = `[Tool Result for ${m.name}]:\n${m.content}`; }
+                        else { role = "user"; text = m.content || ""; }
+                        return { role, parts: [{ text }] };
+                    });
+                    
+                    const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModelName}:generateContent?key=${apiKey}`;
+                    const res = await fetch(url, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ contents, tools: toolsPayload, systemInstruction: { parts: [{ text: systemPrompt }] } })
+                    });
 
-  } catch (error: any) {
-    console.error("AI Service Error:", error);
-    onChunk(`\n[Error: ${error.message || String(error)}]\n`);
+                    if (res.status === 429) throw new Error("429 Too Many Requests");
+                    if (!res.ok) throw new Error(`Google API: ${await res.text()}`);
+                    
+                    const json = await res.json();
+                    const candidate = json.candidates?.[0]?.content;
+                    if (candidate) {
+                        const parts = candidate.parts || [];
+                        const funcCall = parts.find((p: any) => p.functionCall);
+                        if (funcCall) {
+                            responseData = {
+                                content: null,
+                                tool_calls: [{
+                                    id: "call_" + Date.now(),
+                                    function: { name: funcCall.functionCall.name, arguments: JSON.stringify(funcCall.functionCall.args) }
+                                }]
+                            };
+                        } else { responseData = { content: parts.map((p: any) => p.text).join("") }; }
+                    }
+                } else {
+                    // OpenAI / Ollama
+                    let baseUrl = "https://api.openai.com/v1/chat/completions";
+                    if (selectedProvider === "ollama") baseUrl = "http://127.0.0.1:11434/v1/chat/completions";
+                    if (selectedProvider === "openrouter") baseUrl = "https://openrouter.ai/api/v1/chat/completions";
+
+                    const reqBody: any = { model: selectedModelName, messages: messages, stream: false };
+                    if (toolsPayload) { reqBody.tools = toolsPayload; reqBody.tool_choice = "auto"; }
+
+                    const res = await fetch(baseUrl, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+                        body: JSON.stringify(reqBody)
+                    });
+                    
+                    if (res.status === 429) throw new Error("429 Too Many Requests");
+                    if (!res.ok) throw new Error(`API Error: ${await res.text()}`);
+                    const json = await res.json();
+                    responseData = json.choices?.[0]?.message;
+                }
+            } catch (err: any) {
+                if (String(err).includes("429") || String(err).includes("Too Many Requests")) {
+                    // FIXED: Wait only 5 seconds
+                    const waitTime = 5000; 
+                    onChunk(`\n⏳ Rate limit hit. Waiting 5s...\n`);
+                    await sleep(waitTime);
+                } else { throw err; }
+            }
+        }
+
+        if (!responseData) break;
+
+        if (responseData.content) {
+            onChunk(responseData.content);
+            messages.push({ role: "assistant", content: responseData.content });
+        }
+
+        if (responseData.tool_calls && responseData.tool_calls.length > 0) {
+            if (!autoApprove) {
+                onChunk(`\n🛑 **Approval Required**\nAuto-Approve is OFF. Stopping execution.\n`);
+                break; 
+            }
+
+            messages.push(responseData); 
+
+            for (const call of responseData.tool_calls) {
+                const fnName = call.function.name;
+                let fnArgs: any = {};
+                try { fnArgs = typeof call.function.arguments === 'string' ? JSON.parse(call.function.arguments) : call.function.arguments; } catch (e) {}
+                
+                let fileTarget = "";
+                if (fnArgs.path) fileTarget = ` (${fnArgs.path})`;
+                onChunk(`\n🛠️ Executing: ${fnName}${fileTarget}...\n`);
+                
+                // Call MCP
+                let resultStr = "";
+                try {
+                    const result = await mcpManager.callTool(fnName, fnArgs) as any;
+                    if (result && result.content && Array.isArray(result.content)) {
+                         resultStr = result.content.map((c: any) => c.text).join("\n");
+                    } else { resultStr = "Success"; }
+                    onChunk(`✅ Done.\n`);
+                } catch (err) {
+                    resultStr = `Error: ${err}`;
+                    onChunk(`❌ Failed: ${err}\n`);
+                }
+
+                messages.push({ role: "tool", tool_call_id: call.id, name: fnName, content: resultStr });
+            }
+        } else { break; }
+
+      } catch (error: any) {
+          console.error("Loop Error:", error);
+          onChunk(`\n[Error: ${error.message}]\n`);
+          break;
+      }
   }
 }
