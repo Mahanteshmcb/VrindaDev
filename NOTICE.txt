@@ -1,0 +1,5 @@
+VrindaDev
+Copyright 2025 Mahantesh
+
+This product includes software developed by Dyad Tech, Inc. (https://dyad.sh).
+Original source code licensed under Apache License 2.0.

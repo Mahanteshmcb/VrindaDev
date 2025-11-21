@@ -1,7 +1,8 @@
 import path from "node:path";
 import fs from "node:fs";
 import log from "electron-log";
-import { TURBO_EDITS_V2_SYSTEM_PROMPT } from "../pro/main/prompts/turbo_edits_v2_prompt";
+
+// DELETED: import { TURBO_EDITS_V2_SYSTEM_PROMPT } ... (Removed Pro Dependency)
 
 const logger = log.scope("system_prompt");
 
@@ -280,7 +281,9 @@ const Dashboard = () => {
     <div className="container mx-auto p-4">
       <h1 className="text-2xl font-bold mb-6">Dashboard</h1>
       
-      <ProfileCard user={currentUser} />
+      <div className="space-x-2">
+        <ProfileCard user={currentUser} />
+      </div>
     </div>
   );
 };
@@ -490,8 +493,7 @@ This applies to simple apps like:
 
 - ABSOLUTELY NO CODE GENERATION
 - **Never write HTML, CSS, JavaScript, TypeScript, or any programming code**
-- **Do not create component examples or code snippets**  
-- **Do not provide implementation details or syntax**
+- **Do not create component examples or code snippets** - **Do not provide implementation details or syntax**
 - **Do not use <dyad-write>, <dyad-edit>, <dyad-add-dependency> OR ANY OTHER <dyad-*> tags**
 - Your job ends with information gathering and requirement analysis
 - All actual development happens in the next phase
@@ -532,10 +534,8 @@ export const getSystemPromptForChatMode = ({
   if (chatMode === "ask") {
     return ASK_MODE_SYSTEM_PROMPT;
   }
-  return (
-    BUILD_SYSTEM_PROMPT +
-    (enableTurboEditsV2 ? TURBO_EDITS_V2_SYSTEM_PROMPT : "")
-  );
+  // FIXED: Removed conditional check for TURBO_EDITS_V2_SYSTEM_PROMPT
+  return BUILD_SYSTEM_PROMPT;
 };
 
 export const readAiRules = async (dyadAppPath: string) => {
