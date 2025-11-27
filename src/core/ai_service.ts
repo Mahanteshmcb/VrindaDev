@@ -30,8 +30,6 @@ function generateFileTree(dir: string, depth = 0, maxDepth = 3): string {
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- TOOL FORMATTERS ---
-
 function formatToolsOpenAI(tools: any[]) {
     return tools.map(t => ({
         type: "function",
@@ -63,7 +61,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
   const isAgentMode = chatMode === "agent" || chatMode === "build";
   const autoApprove = safeSettings.autoApproveChanges ?? false; 
 
-  console.log(`--- STARTING CHAT (Mode: ${chatMode}, Auto-Approve: ${autoApprove}) ---`);
+  console.log(`--- STARTING CHAT (Mode: ${chatMode.toUpperCase()}, Auto-Approve: ${autoApprove}) ---`);
 
   const selectedProvider = safeSettings.selectedModel?.provider || "openai";
   const selectedModelName = safeSettings.selectedModel?.name || "gpt-4o";
@@ -91,11 +89,10 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
         appRoot = getDyadAppPath(result[0].appPath);
         
         if (isAgentMode) {
-            try { await mcpManager.connect(appRoot); } catch(e) { console.error("MCP Connect Error", e); }
+            try { await mcpManager.connect(appRoot); } catch(e) { console.error(e); }
         }
 
         projectContext += `\n# Project Structure (${result[0].appName}):\n${generateFileTree(appRoot)}\n`;
-        
         for (const comp of selectedComponents) {
             if (comp.relativePath) {
                 try {
@@ -105,7 +102,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
             }
         }
       }
-    } catch (err) {}
+    } catch (err) { console.error(err); }
   }
 
   let mcpTools: any[] = [];
@@ -114,32 +111,34 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
       try {
           const allTools = await mcpManager.listTools();
           
-          if (autoApprove) {
-              mcpTools = allTools;
-          } else {
-              // Manual Mode: READ ONLY tools
-              mcpTools = allTools.filter(t => !['write_file', 'edit_file', 'execute_command'].includes(t.name));
+          if (autoApprove) { mcpTools = allTools; } 
+          else { mcpTools = allTools.filter(t => !['write_file', 'edit_file', 'execute_command'].includes(t.name)); }
+
+          if (mcpTools.length > 0) {
+              toolsPayload = providerType === "google" ? formatToolsGoogle(mcpTools) : formatToolsOpenAI(mcpTools);
           }
-          
           console.log(`🔧 [Agent] Loaded ${mcpTools.length} tools.`);
-          toolsPayload = providerType === "google" ? formatToolsGoogle(mcpTools) : formatToolsOpenAI(mcpTools);
       } catch (e) {}
   }
 
+  // 5. Intelligent System Prompt
   let systemPrompt = "";
   if (isAgentMode) {
       if (autoApprove) {
           systemPrompt = `You are an expert autonomous software engineer.
           DIRECTIVES:
-          1. IMPLEMENT the user's request IMMEDIATELY using tools.
-          2. Call 'write_file' multiple times in one turn to create all needed files.
-          3. Overwrite existing files if needed.
-          4. Do not ask for permission. Just build it.`;
+          1. I have provided the project structure above. DO NOT waste turns listing directories unless you are lost.
+          2. IMPLEMENT the user's request IMMEDIATELY.
+          3. You can call multiple tools in parallel (e.g. create 3 files at once).
+          4. Use 'write_file' to create the app structure.
+          5. Use 'execute_command' to install packages (npm/pnpm) if needed.
+          6. Always aim for a single, complete operation in Turn 1.`;
       } else {
           systemPrompt = `You are a coding consultant. MANUAL APPROVAL is ON.
           INSTRUCTIONS:
           1. You CANNOT modify files directly (write tools are disabled).
-          2. Output the solution in Markdown code blocks (<dyad-write>) so the user can review.`;
+          2. Analyze the request and the provided code.
+          3. To propose file changes, output the solution in Markdown code blocks (<dyad-write>) so the user can review.`;
       }
   } else {
       systemPrompt = "You are a helpful coding assistant. Answer questions based on the code context.";
@@ -150,8 +149,10 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
     { role: "user", content: prompt }
   ];
 
+  // 6. Execution Loop
   let turnCount = 0;
-  const MAX_TURNS = (isAgentMode && autoApprove) ? 10 : 1;
+  const MAX_TURNS = (isAgentMode && autoApprove) ? 12 : 1; 
+  let hasError = false;
 
   while (turnCount < MAX_TURNS) {
       turnCount++;
@@ -164,6 +165,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
         while (attempts < 3 && !responseData) {
             try {
                 attempts++;
+                
                 if (providerType === "google") {
                     const contents = messages.filter(m => m.role !== "system").map(m => {
                         let role = "user";
@@ -190,13 +192,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                         const parts = candidate.parts || [];
                         const funcCall = parts.find((p: any) => p.functionCall);
                         if (funcCall) {
-                            responseData = {
-                                content: null,
-                                tool_calls: [{
-                                    id: "call_" + Date.now(),
-                                    function: { name: funcCall.functionCall.name, arguments: JSON.stringify(funcCall.functionCall.args) }
-                                }]
-                            };
+                            responseData = { content: null, tool_calls: [{ id: "call_" + Date.now(), function: { name: funcCall.functionCall.name, arguments: JSON.stringify(funcCall.functionCall.args) } }] };
                         } else { responseData = { content: parts.map((p: any) => p.text).join("") }; }
                     }
                 } else {
@@ -221,7 +217,6 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                 }
             } catch (err: any) {
                 if (String(err).includes("429") || String(err).includes("Too Many Requests")) {
-                    // FIXED: Wait only 5 seconds
                     const waitTime = 5000; 
                     onChunk(`\n⏳ Rate limit hit. Waiting 5s...\n`);
                     await sleep(waitTime);
@@ -238,7 +233,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
 
         if (responseData.tool_calls && responseData.tool_calls.length > 0) {
             if (!autoApprove) {
-                onChunk(`\n🛑 **Approval Required**\nAuto-Approve is OFF. Stopping execution.\n`);
+                onChunk(`\n🛑 **Approval Required**\nAgent suggested actions, but Auto-Approve is OFF. Please review the output above.\n`);
                 break; 
             }
 
@@ -251,9 +246,9 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                 
                 let fileTarget = "";
                 if (fnArgs.path) fileTarget = ` (${fnArgs.path})`;
+                
                 onChunk(`\n🛠️ Executing: ${fnName}${fileTarget}...\n`);
                 
-                // Call MCP
                 let resultStr = "";
                 try {
                     const result = await mcpManager.callTool(fnName, fnArgs) as any;
@@ -264,6 +259,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                 } catch (err) {
                     resultStr = `Error: ${err}`;
                     onChunk(`❌ Failed: ${err}\n`);
+                    hasError = true;
                 }
 
                 messages.push({ role: "tool", tool_call_id: call.id, name: fnName, content: resultStr });
