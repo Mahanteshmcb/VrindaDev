@@ -14,8 +14,21 @@ class MCPManager {
   private currentRoot: string = "";
 
   private customTools = [
-    { name: "execute_command", description: "Execute a shell command (npm install, git status, etc.).", inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
-    { name: "edit_file", description: "Surgically edit a file by replacing a specific block of code.", inputSchema: { type: "object", properties: { path: { type: "string" }, search: { type: "string" }, replace: { type: "string" } }, required: ["path", "search", "replace"] } }
+    { 
+      name: "execute_command", 
+      description: "Execute a shell command (npm install, git status, etc.). Output is limited to 10MB.", 
+      inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } 
+    },
+    { 
+      name: "create_directory", 
+      description: "Create a new directory.", 
+      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } 
+    },
+    { 
+      name: "edit_file", 
+      description: "Surgically edit a file by replacing a specific block of code.", 
+      inputSchema: { type: "object", properties: { path: { type: "string" }, search: { type: "string" }, replace: { type: "string" } }, required: ["path", "search", "replace"] } 
+    }
   ];
 
   async connect(rootPath: string) {
@@ -47,20 +60,17 @@ class MCPManager {
   }
 
   async listTools() {
-    // FIX: Pass currentRoot explicitly if called without arguments
     if (!this.client) await this.connect(this.currentRoot || process.cwd()); 
     if (!this.client) return []; 
     
     let fileTools: any[] = [];
-    if (this.client) {
-        try {
-            const result = await (this.client as any).request(
-                { method: "tools/list" },
-                { parse: (data: any) => data } 
-            );
-            fileTools = result?.tools || [];
-        } catch (error) {}
-    }
+    try {
+        const result = await (this.client as any).request(
+            { method: "tools/list" },
+            { parse: (data: any) => data } 
+        );
+        fileTools = result?.tools || [];
+    } catch (error) {}
 
     const allTools = [...fileTools, ...this.customTools];
     const uniqueTools = Array.from(new Map(allTools.map(tool => [tool.name, tool])).values());
@@ -69,20 +79,16 @@ class MCPManager {
   }
 
   async callTool(name: string, args: any) {
-    // FIX: Pass currentRoot explicitly if called without arguments
-    if (!this.client) await this.connect(this.currentRoot || process.cwd());
     if (!this.currentRoot) throw new Error("No project root set");
     console.log(`🛠️ [MCP] Executing: ${name}`);
 
-    // Helper to get sanitized path for FS operations
     const getFullPath = (p: string) => path.join(this.currentRoot, p.replace(/^[\\\/]/, ''));
 
-    // --- 1. INTERCEPT WRITE/EDIT (Direct FS Access) ---
+    // --- 1. WRITE & EDIT FILE ---
     if (name === "write_file" || name === "edit_file") {
         try {
             const fullPath = getFullPath(args.path);
             const dir = path.dirname(fullPath);
-            
             if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
 
             let finalContent = args.content;
@@ -95,41 +101,61 @@ class MCPManager {
             
             fs.writeFileSync(fullPath, finalContent, "utf-8");
             
-            return { success: true, message: `Successfully wrote to ${args.path}` };
+            console.log(`💾 [Disk SUCCESS]: Wrote ${args.path}`);
+            return { 
+                success: true, 
+                message: `Successfully wrote to ${args.path}. Verify the content if needed, or proceed to the NEXT file. Do not overwrite this file again with the same content.`
+              };
         } catch (e: any) {
             console.error(`❌ [Disk FAIL]: ${e.message}`);
             return { success: false, error: `File Operation Failed: ${e.message}` };
         }
     }
 
-    // --- 2. INTERCEPT SHELL COMMANDS ---
+    // --- 2. CREATE DIRECTORY ---
+    if (name === "create_directory") {
+        try {
+             const fullPath = getFullPath(args.path);
+             if (!fs.existsSync(fullPath)) {
+                 fs.mkdirSync(fullPath, { recursive: true });
+                 console.log(`📂 [Dir Created]: ${args.path}`);
+                 return { content: [{ type: "text", text: `Created directory: ${args.path}` }] };
+             } else {
+                 return { content: [{ type: "text", text: `Directory exists: ${args.path}` }] };
+             }
+        } catch (e: any) {
+             return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+        }
+    }
+
+    // --- 3. EXECUTE COMMAND ---
     if (name === "execute_command") {
         try {
-            const { stdout, stderr } = await execAsync(args.command, { 
-                cwd: this.currentRoot, 
-                maxBuffer: 10 * 1024 * 1024 
-            });
-            return { content: [{ type: "text", text: stdout + (stderr ? `\nSTDERR:\n${stderr}` : "") }] };
+            const { stdout, stderr } = await execAsync(args.command, { cwd: this.currentRoot, maxBuffer: 10 * 1024 * 1024 });
+            console.log(`💻 [CMD SUCCESS]: ${args.command}`);
+            
+            // Truncate output to prevent context overflow
+            const output = stdout + (stderr ? `\nSTDERR:\n${stderr}` : "");
+            const truncated = output.length > 2000 ? output.substring(0, 2000) + "\n...[Output Truncated]..." : output;
+            
+            return { content: [{ type: "text", text: truncated }] };
         } catch (e: any) { 
             console.error(`CMD Failed: ${args.command}`);
             return { content: [{ type: "text", text: `Command Failed: ${e.message}` }] }; 
         }
     }
 
-    // --- 3. FORWARD READS/LISTS TO SERVER ---
+    // --- 4. READ/LIST (Forward to Server) ---
     if (!this.client) throw new Error("MCP Client not connected");
-    
     try {
-      // NOTE: We still use the server for list_directory/read_file to get the nice JSON-RPC structure
       const result = await (this.client as any).request(
         { method: "tools/call", params: { name, arguments: args } },
         { parse: (data: any) => data }
       );
-      
-      // If the file was read, we log a preview to the backend console
+
       if (name === "read_file" && result.content) {
-          const contentStr = result.content.map((c: any) => c.text).join('\n') || '[EMPTY CONTENT]';
-          console.log(`📖 [Read Success: ${args.path}] (First 200 chars):\n${contentStr.substring(0, 200)}...`);
+          const contentStr = result.content.map((c: any) => c.text).join('\n') || '[EMPTY]';
+          console.log(`📖 [Read]: ${args.path} (${contentStr.length} bytes)`);
       }
       
       return result;

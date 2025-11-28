@@ -30,6 +30,8 @@ function generateFileTree(dir: string, depth = 0, maxDepth = 3): string {
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// --- TOOL FORMATTERS ---
+
 function formatToolsOpenAI(tools: any[]) {
     return tools.map(t => ({
         type: "function",
@@ -55,6 +57,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
   const chatId = safeParams.chatId;
   const selectedComponents = safeParams.selectedComponents || [];
 
+  // 1. Load Settings
   const settings = await readSettings();
   const safeSettings = settings as any; 
   const chatMode = safeSettings.selectedChatMode || "ask"; 
@@ -63,6 +66,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
 
   console.log(`--- STARTING CHAT (Mode: ${chatMode.toUpperCase()}, Auto-Approve: ${autoApprove}) ---`);
 
+  // 2. Configure Provider
   const selectedProvider = safeSettings.selectedModel?.provider || "openai";
   const selectedModelName = safeSettings.selectedModel?.name || "gpt-4o";
   let apiKey = "";
@@ -77,6 +81,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
   if (!apiKey) { onChunk(`Error: No API Key found.`); return; }
   if (selectedProvider === "google" || selectedModelName.startsWith("gemini")) providerType = "google";
 
+  // 3. Build Context & Connect MCP
   let projectContext = "";
   let appRoot = "";
 
@@ -88,9 +93,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
       if (result[0]?.appPath) {
         appRoot = getDyadAppPath(result[0].appPath);
         
-        if (isAgentMode) {
-            try { await mcpManager.connect(appRoot); } catch(e) { console.error(e); }
-        }
+        if (isAgentMode) { try { await mcpManager.connect(appRoot); } catch(e) { console.error(e); } }
 
         projectContext += `\n# Project Structure (${result[0].appName}):\n${generateFileTree(appRoot)}\n`;
         for (const comp of selectedComponents) {
@@ -102,9 +105,10 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
             }
         }
       }
-    } catch (err) { console.error(err); }
+    } catch (err) {}
   }
 
+  // 4. Load Tools
   let mcpTools: any[] = [];
   let toolsPayload: any = undefined;
   if (isAgentMode && appRoot) {
@@ -112,7 +116,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
           const allTools = await mcpManager.listTools();
           
           if (autoApprove) { mcpTools = allTools; } 
-          else { mcpTools = allTools.filter(t => !['write_file', 'edit_file', 'execute_command'].includes(t.name)); }
+          else { mcpTools = allTools.filter(t => !['write_file', 'edit_file', 'execute_command', 'create_directory'].includes(t.name)); }
 
           if (mcpTools.length > 0) {
               toolsPayload = providerType === "google" ? formatToolsGoogle(mcpTools) : formatToolsOpenAI(mcpTools);
@@ -121,27 +125,30 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
       } catch (e) {}
   }
 
-  // 5. Intelligent System Prompt
+  // 5. System Prompt
   let systemPrompt = "";
   if (isAgentMode) {
       if (autoApprove) {
-          systemPrompt = `You are an expert autonomous software engineer.
-          DIRECTIVES:
-          1. I have provided the project structure above. DO NOT waste turns listing directories unless you are lost.
-          2. IMPLEMENT the user's request IMMEDIATELY.
-          3. You can call multiple tools in parallel (e.g. create 3 files at once).
-          4. Use 'write_file' to create the app structure.
-          5. Use 'execute_command' to install packages (npm/pnpm) if needed.
-          6. Always aim for a single, complete operation in Turn 1.`;
+          // --- AUTONOMOUS BUILDER (Simplified) ---
+          systemPrompt = `You are an expert software engineer.
+          
+          YOUR GOAL: Build the requested app immediately.
+          
+          RULES:
+          1. Use 'write_file' to create files.
+          2. Use 'execute_command' to install packages.
+          3. Do not ask questions. Just write the code.
+          4. Call multiple tools in one turn to be fast.
+          `;
       } else {
-          systemPrompt = `You are a coding consultant. MANUAL APPROVAL is ON.
-          INSTRUCTIONS:
-          1. You CANNOT modify files directly (write tools are disabled).
-          2. Analyze the request and the provided code.
-          3. To propose file changes, output the solution in Markdown code blocks (<dyad-write>) so the user can review.`;
+          // --- MANUAL MODE ---
+          systemPrompt = `You are a coding consultant.
+          The user must manually approve changes.
+          Output code in Markdown blocks (<dyad-write>) for review.
+          Do NOT use write tools.`;
       }
   } else {
-      systemPrompt = "You are a helpful coding assistant. Answer questions based on the code context.";
+      systemPrompt = "You are a helpful coding assistant.";
   }
 
   let messages: any[] = [
@@ -151,8 +158,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
 
   // 6. Execution Loop
   let turnCount = 0;
-  const MAX_TURNS = (isAgentMode && autoApprove) ? 12 : 1; 
-  let hasError = false;
+  const MAX_TURNS = (isAgentMode && autoApprove) ? 15 : 1; // Increased turns for complex apps
 
   while (turnCount < MAX_TURNS) {
       turnCount++;
@@ -165,7 +171,7 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
         while (attempts < 3 && !responseData) {
             try {
                 attempts++;
-                
+                // Standard API Call Logic
                 if (providerType === "google") {
                     const contents = messages.filter(m => m.role !== "system").map(m => {
                         let role = "user";
@@ -232,22 +238,32 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
         }
 
         if (responseData.tool_calls && responseData.tool_calls.length > 0) {
+            
             if (!autoApprove) {
-                onChunk(`\n🛑 **Approval Required**\nAgent suggested actions, but Auto-Approve is OFF. Please review the output above.\n`);
-                break; 
+                const isWrite = responseData.tool_calls.some((t: any) => ['write_file', 'edit_file', 'execute_command', 'create_directory'].includes(t.function.name));
+                if (isWrite) {
+                    onChunk(`\n🛑 **Manual Approval Required**\nAgent suggested actions, but Auto-Approve is OFF. Please review the output above.\n`);
+                    break; 
+                }
             }
 
             messages.push(responseData); 
+            let hasError = false;
 
             for (const call of responseData.tool_calls) {
                 const fnName = call.function.name;
                 let fnArgs: any = {};
                 try { fnArgs = typeof call.function.arguments === 'string' ? JSON.parse(call.function.arguments) : call.function.arguments; } catch (e) {}
                 
+                // Clean Path
+                if (fnArgs.path) fnArgs.path = fnArgs.path.replace(/^(C:\\.*\\dyad-apps\\[^\\]+\\)/i, '').replace(/^path[\\\/]to[\\\/]project[\\\/]/i, '');
+                
                 let fileTarget = "";
                 if (fnArgs.path) fileTarget = ` (${fnArgs.path})`;
                 
-                onChunk(`\n🛠️ Executing: ${fnName}${fileTarget}...\n`);
+                // VISUAL LOG
+                const emoji = fnName.includes("write") ? "💾" : fnName.includes("read") ? "📖" : "🛠️";
+                onChunk(`\n${emoji} **Agent:** ${fnName}${fileTarget}\n`);
                 
                 let resultStr = "";
                 try {
@@ -264,6 +280,12 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
 
                 messages.push({ role: "tool", tool_call_id: call.id, name: fnName, content: resultStr });
             }
+            
+            if (hasError && !(safeSettings.enableAutoFixProblems ?? true)) { 
+                 onChunk(`\n⚠️ **Error Detected**\nAuto-Fix is OFF. Stopping.\n`);
+                 break;
+            }
+
         } else { break; }
 
       } catch (error: any) {
