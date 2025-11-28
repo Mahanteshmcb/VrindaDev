@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, asc } from "drizzle-orm";
 import { readSettings } from "../main/settings";
 import type { ChatStreamParams } from "../ipc/ipc_types";
 import { db } from "../db";
@@ -10,13 +10,13 @@ import { mcpManager } from "./mcp_manager";
 
 // --- HELPERS ---
 
-function generateFileTree(dir: string, depth = 0, maxDepth = 3): string {
+function generateFileTree(dir: string, depth = 0, maxDepth = 4): string {
   if (depth > maxDepth) return "";
   let tree = "";
   try {
     const files = fs.readdirSync(dir);
     for (const file of files) {
-      if (["node_modules", ".git", "dist", "build", ".next", ".vscode"].includes(file)) continue;
+      if (["node_modules", ".git", "dist", "build", ".next", ".vscode", ".DS_Store", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"].includes(file)) continue;
       const fullPath = path.join(dir, file);
       if (fs.statSync(fullPath).isDirectory()) {
         tree += "  ".repeat(depth) + `📁 ${file}/\n` + generateFileTree(fullPath, depth + 1, maxDepth);
@@ -66,24 +66,46 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
 
   console.log(`--- STARTING CHAT (Mode: ${chatMode.toUpperCase()}, Auto-Approve: ${autoApprove}) ---`);
 
-  // 2. Configure Provider
-  const selectedProvider = safeSettings.selectedModel?.provider || "openai";
-  const selectedModelName = safeSettings.selectedModel?.name || "gpt-4o";
-  let apiKey = "";
-  let providerType = "openai"; 
+  // 2. Build Provider Queue (Auto-Switching Logic)
+  let providerQueue: Array<{ id: string, model: string, key: string }> = [];
+  
+  const getKey = (p: string) => safeSettings.providerSettings?.[p]?.apiKey?.value || safeSettings.apiKeys?.[p];
+  const requestedProvider = safeSettings.selectedModel?.provider || "auto";
 
-  if (selectedProvider === "ollama") apiKey = "ollama"; 
-  else {
-    apiKey = safeSettings.providerSettings?.[selectedProvider]?.apiKey?.value || safeSettings.apiKeys?.[selectedProvider] || "";
-    if (!apiKey && selectedProvider === "google") apiKey = safeSettings.providerSettings?.google?.apiKey?.value || safeSettings.apiKeys?.google;
+  if (requestedProvider !== "auto") {
+      // Manual Mode: Use selected provider only
+      let key = getKey(requestedProvider);
+      if (requestedProvider === "ollama") key = "ollama";
+      
+      providerQueue.push({ 
+          id: requestedProvider, 
+          model: safeSettings.selectedModel?.name || "gpt-4o", 
+          key: key || "" 
+      });
+  } else {
+      // Auto Mode: Priority Fallback Chain
+      if (getKey("openrouter")) providerQueue.push({ id: "openrouter", model: "google/gemini-2.0-flash-001", key: getKey("openrouter") });
+      if (getKey("google")) providerQueue.push({ id: "google", model: "gemini-1.5-pro-latest", key: getKey("google") });
+      if (getKey("openai")) providerQueue.push({ id: "openai", model: "gpt-4o", key: getKey("openai") });
+      if (getKey("anthropic")) providerQueue.push({ id: "anthropic", model: "claude-3-5-sonnet-latest", key: getKey("anthropic") });
+      if (safeSettings.isOllamaEnabled || getKey("ollama")) providerQueue.push({ id: "ollama", model: "llama3", key: "ollama" });
   }
 
-  if (!apiKey) { onChunk(`Error: No API Key found.`); return; }
-  if (selectedProvider === "google" || selectedModelName.startsWith("gemini")) providerType = "google";
+  // Filter invalid keys
+  providerQueue = providerQueue.filter(p => p.key && p.key.trim() !== "");
 
-  // 3. Build Context & Connect MCP
+  if (providerQueue.length === 0) {
+      onChunk("❌ Error: No valid API keys found. Please check Settings.");
+      return;
+  }
+
+  console.log(`🤖 [Router] Provider Queue: ${providerQueue.map(p => p.id).join(" -> ")}`);
+
+  // 3. Build Context & Detect Package Manager & LOAD HISTORY
   let projectContext = "";
   let appRoot = "";
+  let packageManager = "npm"; // Default
+  let historyMessages: any[] = [];
 
   if (chatId) {
     try {
@@ -93,9 +115,16 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
       if (result[0]?.appPath) {
         appRoot = getDyadAppPath(result[0].appPath);
         
-        if (isAgentMode) { try { await mcpManager.connect(appRoot); } catch(e) { console.error(e); } }
+        // Detect Package Manager
+        if (fs.existsSync(path.join(appRoot, "pnpm-lock.yaml"))) packageManager = "pnpm";
+        else if (fs.existsSync(path.join(appRoot, "yarn.lock"))) packageManager = "yarn";
+        
+        console.log(`📦 [Project] Detected Package Manager: ${packageManager}`);
 
-        projectContext += `\n# Project Structure (${result[0].appName}):\n${generateFileTree(appRoot)}\n`;
+        try { await mcpManager.connect(appRoot); } catch(e) { console.error("MCP Connect Error:", e); }
+
+        projectContext += `\n# Project Context (${result[0].appName})\nRoot: ${appRoot}\nPackage Manager: ${packageManager}\n\n## File Structure:\n${generateFileTree(appRoot)}\n`;
+        
         for (const comp of selectedComponents) {
             if (comp.relativePath) {
                 try {
@@ -104,75 +133,117 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                 } catch(e) {}
             }
         }
+
+        // --- LOAD HISTORY (Critical for Manual Mode Context) ---
+        try {
+            const dbMsgs = await db.select()
+                .from(messagesTable)
+                .where(eq(messagesTable.chatId, chatId))
+                .orderBy(asc(messagesTable.id)); 
+            
+            // Map DB messages to LLM format. We take the last 20 for context window efficiency.
+            historyMessages = dbMsgs.slice(-20).map(msg => ({
+                role: msg.role === 'user' ? 'user' : 'assistant',
+                content: msg.content || "" 
+            }));
+        } catch (dbErr) {
+            console.error("Failed to load chat history:", dbErr);
+        }
       }
-    } catch (err) {}
+    } catch (err) { console.error("Context Load Error:", err); }
   }
 
   // 4. Load Tools
   let mcpTools: any[] = [];
-  let toolsPayload: any = undefined;
+  
   if (isAgentMode && appRoot) {
       try {
-          const allTools = await mcpManager.listTools();
-          
-          if (autoApprove) { mcpTools = allTools; } 
-          else { mcpTools = allTools.filter(t => !['write_file', 'edit_file', 'execute_command', 'create_directory'].includes(t.name)); }
-
-          if (mcpTools.length > 0) {
-              toolsPayload = providerType === "google" ? formatToolsGoogle(mcpTools) : formatToolsOpenAI(mcpTools);
-          }
+          mcpTools = await mcpManager.listTools();
           console.log(`🔧 [Agent] Loaded ${mcpTools.length} tools.`);
-      } catch (e) {}
+      } catch (e) { console.error("Tool Load Error:", e); }
   }
 
   // 5. System Prompt
   let systemPrompt = "";
   if (isAgentMode) {
       if (autoApprove) {
-          // --- AUTONOMOUS BUILDER (Simplified) ---
-          systemPrompt = `You are an expert software engineer.
+          // --- AUTONOMOUS BUILDER ---
+          systemPrompt = `You are a Senior Software Engineer acting as an autonomous agent.
           
-          YOUR GOAL: Build the requested app immediately.
+          YOUR GOAL: Complete the user's request fully and efficiently.
           
-          RULES:
-          1. Use 'write_file' to create files.
-          2. Use 'execute_command' to install packages.
-          3. Do not ask questions. Just write the code.
-          4. Call multiple tools in one turn to be fast.
+          CAPABILITIES:
+          - You can create, edit, and read files.
+          - You can execute shell commands (npm, git, etc.).
+          - You can list directories and SEARCH for files.
+          
+          CRITICAL RULES FOR FILES:
+          1. **Never Guess Paths**: If a file read fails with "File not found", STOP guessing.
+          2. **Use Search**: If you are unsure of a file path, use 'search_files'.
+          3. **Read Before Edit**: Always read a file before editing to ensure you have the latest content.
+          
+          CRITICAL RULES FOR COMMANDS:
+          1. **Package Manager**: THIS PROJECT USES **${packageManager.toUpperCase()}**. ALWAYS use '${packageManager} install' or '${packageManager} add'.
+          2. **Non-Interactive**: Always use flags like '-y' or '--yes'.
+          
+          GENERAL RULES:
+          - Be robust. If a tool fails, analyze the error and try a different strategy.
+          - Do NOT ask for permission. You have full authority. Just do it.
           `;
       } else {
-          // --- MANUAL MODE ---
-          systemPrompt = `You are a coding consultant.
-          The user must manually approve changes.
-          Output code in Markdown blocks (<dyad-write>) for review.
-          Do NOT use write tools.`;
+          // --- MANUAL / ADVISORY MODE ---
+          systemPrompt = `You are a Senior Software Engineer acting as an agent.
+          
+          **OPERATIONAL MODE: MANUAL APPROVAL**
+          
+          CRITICAL RULES:
+          1. **DO NOT** generate XML tags (like <dyad-write>, <dyad-execute>) yourself. The system handles UI rendering.
+          2. **ALWAYS USE TOOLS**: To modify files or run commands, you MUST call the corresponding tool ('write_file', 'execute_command').
+          3. **Wait for Approval**: After calling a tool, execution will pause. The user will review your proposal.
+          4. **Package Manager**: Use **${packageManager.toUpperCase()}**.
+          5. **History**: Check history to see what was previously proposed/rejected.
+          `;
       }
   } else {
-      systemPrompt = "You are a helpful coding assistant.";
+      systemPrompt = "You are a helpful coding assistant. Answer questions about the code provided.";
   }
 
   let messages: any[] = [
     { role: "system", content: systemPrompt + projectContext },
+    ...historyMessages,
     { role: "user", content: prompt }
   ];
 
   // 6. Execution Loop
   let turnCount = 0;
-  const MAX_TURNS = (isAgentMode && autoApprove) ? 15 : 1; // Increased turns for complex apps
+  const MAX_TURNS = (isAgentMode && autoApprove) ? 50 : 1; 
+  let currentProviderIndex = 0;
 
   while (turnCount < MAX_TURNS) {
       turnCount++;
-      if (isAgentMode && autoApprove) console.log(`🔄 [Loop] Turn ${turnCount}`);
+      if (isAgentMode && autoApprove) console.log(`🔄 [Loop] Turn ${turnCount}/${MAX_TURNS}`);
 
       try {
         let responseData: any = null;
         let attempts = 0;
 
-        while (attempts < 3 && !responseData) {
+        // Smart Retry & Switch Loop
+        while (!responseData && attempts < 10) {
+            attempts++;
+            const currentConfig = providerQueue[currentProviderIndex];
+            
+            const providerType = (currentConfig.id === "google") ? "google" : "openai";
+            const apiKey = currentConfig.key;
+            const modelName = currentConfig.model;
+
+            // Format tools for current provider
+            const toolsPayload = (mcpTools.length > 0) 
+                ? (providerType === "google" ? formatToolsGoogle(mcpTools) : formatToolsOpenAI(mcpTools)) 
+                : undefined;
+
             try {
-                attempts++;
-                // Standard API Call Logic
                 if (providerType === "google") {
+                    // --- GOOGLE NATIVE API ---
                     const contents = messages.filter(m => m.role !== "system").map(m => {
                         let role = "user";
                         let text = "";
@@ -182,14 +253,14 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                         return { role, parts: [{ text }] };
                     });
                     
-                    const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModelName}:generateContent?key=${apiKey}`;
+                    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
                     const res = await fetch(url, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ contents, tools: toolsPayload, systemInstruction: { parts: [{ text: systemPrompt }] } })
                     });
 
-                    if (res.status === 429) throw new Error("429 Too Many Requests");
+                    if (res.status === 429 || res.status === 503) throw new Error("RateLimit");
                     if (!res.ok) throw new Error(`Google API: ${await res.text()}`);
                     
                     const json = await res.json();
@@ -202,31 +273,53 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                         } else { responseData = { content: parts.map((p: any) => p.text).join("") }; }
                     }
                 } else {
-                    // OpenAI / Ollama
+                    // --- OPENAI / OPENROUTER / OLLAMA ---
                     let baseUrl = "https://api.openai.com/v1/chat/completions";
-                    if (selectedProvider === "ollama") baseUrl = "http://127.0.0.1:11434/v1/chat/completions";
-                    if (selectedProvider === "openrouter") baseUrl = "https://openrouter.ai/api/v1/chat/completions";
+                    if (currentConfig.id === "ollama") baseUrl = "http://127.0.0.1:11434/v1/chat/completions";
+                    if (currentConfig.id === "openrouter") baseUrl = "https://openrouter.ai/api/v1/chat/completions";
 
-                    const reqBody: any = { model: selectedModelName, messages: messages, stream: false };
+                    const reqBody: any = { model: modelName, messages: messages, stream: false };
                     if (toolsPayload) { reqBody.tools = toolsPayload; reqBody.tool_choice = "auto"; }
 
-                    const res = await fetch(baseUrl, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-                        body: JSON.stringify(reqBody)
-                    });
+                    const headers: any = { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` };
+                    if (currentConfig.id === "openrouter") {
+                        headers["HTTP-Referer"] = "https://dyad.sh"; 
+                        headers["X-Title"] = "Dyad";
+                    }
+
+                    const res = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
                     
-                    if (res.status === 429) throw new Error("429 Too Many Requests");
+                    if (res.status === 429 || res.status === 503) throw new Error("RateLimit");
                     if (!res.ok) throw new Error(`API Error: ${await res.text()}`);
                     const json = await res.json();
                     responseData = json.choices?.[0]?.message;
                 }
             } catch (err: any) {
-                if (String(err).includes("429") || String(err).includes("Too Many Requests")) {
-                    const waitTime = 5000; 
-                    onChunk(`\n⏳ Rate limit hit. Waiting 5s...\n`);
-                    await sleep(waitTime);
-                } else { throw err; }
+                const isRateLimit = String(err).includes("RateLimit") || String(err).includes("429") || String(err).includes("503") || String(err).includes("Overloaded");
+                
+                if (isRateLimit) {
+                    onChunk(`\n⚠️ Provider **${currentConfig.id}** is overloaded.`);
+                    
+                    if (providerQueue.length > 1) {
+                        // Switch to next provider
+                        currentProviderIndex = (currentProviderIndex + 1) % providerQueue.length;
+                        onChunk(` Switching to **${providerQueue[currentProviderIndex].id}**...\n`);
+                        // Loop continues immediately with new provider
+                    } else {
+                        onChunk(`\n⏳ Waiting 5s to retry...\n`);
+                        await sleep(5000);
+                    }
+                } else {
+                    // Fatal error (auth, bad request)
+                    console.error("Fatal API Error:", err);
+                    // Try next provider anyway just in case it's a specific provider outage
+                    if (providerQueue.length > 1) {
+                         currentProviderIndex = (currentProviderIndex + 1) % providerQueue.length;
+                         onChunk(` Error encountered. Switching to **${providerQueue[currentProviderIndex].id}**...\n`);
+                    } else {
+                        throw err;
+                    }
+                }
             }
         }
 
@@ -239,10 +332,34 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
 
         if (responseData.tool_calls && responseData.tool_calls.length > 0) {
             
+            // --- MANUAL APPROVAL LOGIC ---
             if (!autoApprove) {
                 const isWrite = responseData.tool_calls.some((t: any) => ['write_file', 'edit_file', 'execute_command', 'create_directory'].includes(t.function.name));
+                
                 if (isWrite) {
-                    onChunk(`\n🛑 **Manual Approval Required**\nAgent suggested actions, but Auto-Approve is OFF. Please review the output above.\n`);
+                    // INTERCEPT TOOL CALL: Convert to Dyad UI Tag instead of executing
+                    for (const call of responseData.tool_calls) {
+                        const fnName = call.function.name;
+                        let fnArgs: any = {};
+                        try { fnArgs = JSON.parse(call.function.arguments); } catch(e) {}
+                        
+                        let uiTag = "";
+                        // Force 'path' attribute for consistency with parsers
+                        let pathVal = fnArgs.path || ""; 
+                        
+                        if (fnName === "write_file") {
+                            uiTag = `\n<dyad-write path="${pathVal}" description="Proposed file creation">\n${fnArgs.content}\n</dyad-write>\n`;
+                        } else if (fnName === "edit_file") {
+                            uiTag = `\n<dyad-write path="${pathVal}" description="Proposed edit (Full overwrite for safety)">\n${fnArgs.content || "(Content missing from tool call)"}\n</dyad-write>\n`;
+                        } else if (fnName === "execute_command") {
+                            uiTag = `\n<dyad-command type="execute" command="${fnArgs.command}">Run: ${fnArgs.command}</dyad-command>\n`;
+                        } else {
+                            uiTag = `\n> **Proposal:** Run tool \`${fnName}\` on \`${pathVal}\`\n`;
+                        }
+                        
+                        onChunk(uiTag);
+                    }
+                    // Stop execution loop. The UI renders the tag. User must interact or reply.
                     break; 
                 }
             }
@@ -255,42 +372,44 @@ export async function streamChat(params: ChatStreamParams, onChunk: (content: st
                 let fnArgs: any = {};
                 try { fnArgs = typeof call.function.arguments === 'string' ? JSON.parse(call.function.arguments) : call.function.arguments; } catch (e) {}
                 
-                // Clean Path
                 if (fnArgs.path) fnArgs.path = fnArgs.path.replace(/^(C:\\.*\\dyad-apps\\[^\\]+\\)/i, '').replace(/^path[\\\/]to[\\\/]project[\\\/]/i, '');
                 
-                let fileTarget = "";
-                if (fnArgs.path) fileTarget = ` (${fnArgs.path})`;
+                let fileTarget = fnArgs.path ? ` (${fnArgs.path})` : "";
+                if (fnName === "search_files") fileTarget = ` "${fnArgs.pattern || ''}"`;
                 
-                // VISUAL LOG
-                const emoji = fnName.includes("write") ? "💾" : fnName.includes("read") ? "📖" : "🛠️";
+                const emojiMap: Record<string, string> = { "write_file": "💾", "edit_file": "📝", "read_file": "📖", "execute_command": "💻", "create_directory": "📂", "list_directory": "👀", "search_files": "🔎" };
+                const emoji = emojiMap[fnName] || "🛠️";
                 onChunk(`\n${emoji} **Agent:** ${fnName}${fileTarget}\n`);
                 
                 let resultStr = "";
                 try {
                     const result = await mcpManager.callTool(fnName, fnArgs) as any;
+                    
                     if (result && result.content && Array.isArray(result.content)) {
                          resultStr = result.content.map((c: any) => c.text).join("\n");
+                    } else if (result && result.error) {
+                         resultStr = `Error: ${result.error}`;
+                         hasError = true;
                     } else { resultStr = "Success"; }
-                    onChunk(`✅ Done.\n`);
+                    
+                    if (!hasError) onChunk(`✅ Done.\n`);
+                    else onChunk(`❌ Failed: ${resultStr.substring(0, 100)}...\n`);
+
                 } catch (err) {
                     resultStr = `Error: ${err}`;
                     onChunk(`❌ Failed: ${err}\n`);
                     hasError = true;
                 }
-
                 messages.push({ role: "tool", tool_call_id: call.id, name: fnName, content: resultStr });
             }
             
-            if (hasError && !(safeSettings.enableAutoFixProblems ?? true)) { 
-                 onChunk(`\n⚠️ **Error Detected**\nAuto-Fix is OFF. Stopping.\n`);
-                 break;
-            }
+            if (hasError && !(safeSettings.enableAutoFixProblems ?? true)) break;
 
         } else { break; }
 
       } catch (error: any) {
-          console.error("Loop Error:", error);
-          onChunk(`\n[Error: ${error.message}]\n`);
+          console.error("Loop Fatal Error:", error);
+          onChunk(`\n[Fatal Error: ${error.message}]\n`);
           break;
       }
   }

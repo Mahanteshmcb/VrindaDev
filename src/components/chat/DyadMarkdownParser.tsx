@@ -303,13 +303,16 @@ function renderCustomTag(
 ): React.ReactNode {
   const { tag, attributes, content, inProgress } = tagInfo;
 
+  // FIXED: Normalize path/file attribute to ensure UI gets the right prop
+  const filePath = attributes.path || attributes.file || "";
+
   switch (tag) {
     case "dyad-read":
       return (
         <DyadRead
           node={{
             properties: {
-              path: attributes.path || "",
+              path: filePath,
             },
           }}
         >
@@ -385,7 +388,7 @@ function renderCustomTag(
         <DyadWrite
           node={{
             properties: {
-              path: attributes.path || "",
+              path: filePath,
               description: attributes.description || "",
               state: getState({ isStreaming, inProgress }),
             },
@@ -414,7 +417,7 @@ function renderCustomTag(
         <DyadDelete
           node={{
             properties: {
-              path: attributes.path || "",
+              path: filePath,
             },
           }}
         >
@@ -467,7 +470,7 @@ function renderCustomTag(
         <DyadEdit
           node={{
             properties: {
-              path: attributes.path || "",
+              path: filePath,
               description: attributes.description || "",
               state: getState({ isStreaming, inProgress }),
             },
@@ -482,7 +485,7 @@ function renderCustomTag(
         <DyadSearchReplace
           node={{
             properties: {
-              path: attributes.path || "",
+              path: filePath,
               description: attributes.description || "",
               state: getState({ isStreaming, inProgress }),
             },

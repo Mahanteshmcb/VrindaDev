@@ -4,6 +4,7 @@ const SIMILARITY_THRESHOLD = 0.85;
 
 /**
  * Executes a robust, open-source Fuzzy Search & Replace on a file string.
+ * Optimized for code editing where exact matches might fail due to minor whitespace differences.
  */
 export function applySearchReplace(
   fileContent: string, 
@@ -35,16 +36,24 @@ export function applySearchReplace(
   let bestScore = 0;
   let bestIndex = -1;
 
+  // Optimization: Don't iterate if file is huge and search is tiny, 
+  // but for code editing, we need precision. 
+  // We iterate through valid start positions.
   for (let i = 0; i <= fileLines.length - searchLines.length; i++) {
     const chunk = fileLines.slice(i, i + searchLines.length);
     const chunkTrimmed = chunk.map(l => l.trim()).join("\n");
     
-    // Quick check to skip impossible matches
-    if (fileLines[i].trim() !== searchLines[0].trim() && distance(fileLines[i].trim(), searchLines[0].trim()) > 5) {
-        continue; 
+    // Quick check to skip impossible matches (first line mismatch)
+    // Using a looser check for the first line to allow for some variance
+    if (fileLines[i].trim() !== searchLines[0].trim()) {
+        const firstLineDist = distance(fileLines[i].trim(), searchLines[0].trim());
+        const maxLen = Math.max(fileLines[i].trim().length, searchLines[0].trim().length);
+        if (maxLen > 0 && (1 - firstLineDist / maxLen) < 0.5) {
+             continue; // First line is too different, skip chunk
+        }
     }
 
-    // Calculate Similarity
+    // Calculate Similarity for the whole block
     const dist = distance(chunkTrimmed, searchTrimmed);
     const maxLen = Math.max(chunkTrimmed.length, searchTrimmed.length);
     if (maxLen === 0) continue;
@@ -56,7 +65,7 @@ export function applySearchReplace(
       bestIndex = i;
     }
 
-    if (bestScore > 0.98) break; 
+    if (bestScore > 0.99) break; // Exact match found in trimmed mode
   }
 
   // 4. Apply Replacement if threshold met
@@ -70,7 +79,9 @@ export function applySearchReplace(
       // Apply indentation to the replacement block
       const indentedReplaceLines = replaceLines.map((line) => {
           if (line.trim() === "") return line;
-          // Apply the file's base indent, removing any potential leading space from the block
+          // Only add indent if the replacement line doesn't already have it
+          // or if we are assuming the replace block provided is unindented.
+          // Strategy: Strip leading whitespace from replace block and apply actualIndent.
           return actualIndent + line.trimStart(); 
       });
 

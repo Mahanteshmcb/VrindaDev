@@ -4,13 +4,15 @@ import { SqlQuery } from "../../lib/schemas";
 
 const logger = log.scope("dyad_tag_parser");
 
+// Helper regex that matches either path="value" or file="value"
+const PATH_OR_FILE_REGEX = /(?:path|file)="([^"]+)"/;
+
 export function getDyadWriteTags(fullResponse: string): {
   path: string;
   content: string;
   description?: string;
 }[] {
   const dyadWriteRegex = /<dyad-write([^>]*)>([\s\S]*?)<\/dyad-write>/gi;
-  const pathRegex = /path="([^"]+)"/;
   const descriptionRegex = /description="([^"]+)"/;
 
   let match;
@@ -20,7 +22,7 @@ export function getDyadWriteTags(fullResponse: string): {
     const attributesString = match[1];
     let content = match[2].trim();
 
-    const pathMatch = pathRegex.exec(attributesString);
+    const pathMatch = PATH_OR_FILE_REGEX.exec(attributesString);
     const descriptionMatch = descriptionRegex.exec(attributesString);
 
     if (pathMatch && pathMatch[1]) {
@@ -39,7 +41,7 @@ export function getDyadWriteTags(fullResponse: string): {
       tags.push({ path: normalizePath(path), content, description });
     } else {
       logger.warn(
-        "Found <dyad-write> tag without a valid 'path' attribute:",
+        "Found <dyad-write> tag without a valid 'path' or 'file' attribute:",
         match[0],
       );
     }
@@ -65,12 +67,16 @@ export function getDyadRenameTags(fullResponse: string): {
 }
 
 export function getDyadDeleteTags(fullResponse: string): string[] {
-  const dyadDeleteRegex =
-    /<dyad-delete path="([^"]+)"[^>]*>([\s\S]*?)<\/dyad-delete>/g;
+  const dyadDeleteRegex = /<dyad-delete ([^>]*)>([\s\S]*?)<\/dyad-delete>/g;
+  
   let match;
   const paths: string[] = [];
   while ((match = dyadDeleteRegex.exec(fullResponse)) !== null) {
-    paths.push(normalizePath(match[1]));
+    const attributesString = match[1];
+    const pathMatch = PATH_OR_FILE_REGEX.exec(attributesString);
+    if (pathMatch && pathMatch[1]) {
+        paths.push(normalizePath(pathMatch[1]));
+    }
   }
   return paths;
 }
@@ -109,7 +115,6 @@ export function getDyadExecuteSqlTags(fullResponse: string): SqlQuery[] {
     const descriptionMatch = descriptionRegex.exec(attributesString);
     const description = descriptionMatch?.[1];
 
-    // Handle markdown code blocks if present
     const contentLines = content.split("\n");
     if (contentLines[0]?.startsWith("```")) {
       contentLines.shift();
@@ -145,7 +150,6 @@ export function getDyadSearchReplaceTags(fullResponse: string): {
 }[] {
   const dyadSearchReplaceRegex =
     /<dyad-search-replace([^>]*)>([\s\S]*?)<\/dyad-search-replace>/gi;
-  const pathRegex = /path="([^"]+)"/;
   const descriptionRegex = /description="([^"]+)"/;
 
   let match;
@@ -155,14 +159,13 @@ export function getDyadSearchReplaceTags(fullResponse: string): {
     const attributesString = match[1] || "";
     let content = match[2].trim();
 
-    const pathMatch = pathRegex.exec(attributesString);
+    const pathMatch = PATH_OR_FILE_REGEX.exec(attributesString);
     const descriptionMatch = descriptionRegex.exec(attributesString);
 
     if (pathMatch && pathMatch[1]) {
       const path = pathMatch[1];
       const description = descriptionMatch?.[1];
 
-      // Handle markdown code fences if present
       const contentLines = content.split("\n");
       if (contentLines[0]?.startsWith("```")) {
         contentLines.shift();

@@ -4,6 +4,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
 import path from "path";
+import { glob } from "glob";
 import { applySearchReplace } from "./search_replace";
 
 const execAsync = promisify(exec);
@@ -16,12 +17,32 @@ class MCPManager {
   private customTools = [
     { 
       name: "execute_command", 
-      description: "Execute a shell command (npm install, git status, etc.). Output is limited to 10MB.", 
+      description: "Execute a shell command (npm install, git status, build scripts, etc.). Output is limited to 2MB.", 
       inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } 
     },
     { 
       name: "create_directory", 
-      description: "Create a new directory.", 
+      description: "Create a new directory recursively.", 
+      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } 
+    },
+    { 
+      name: "list_directory", 
+      description: "List files and folders in a directory (non-recursive).", 
+      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } 
+    },
+    {
+      name: "search_files",
+      description: "Search for files using a glob pattern. USE THIS if you cannot find a file or are unsure of the path.",
+      inputSchema: { type: "object", properties: { pattern: { type: "string", description: "Glob pattern (e.g. '**/button.tsx' or 'src/**/*.css')" } }, required: ["pattern"] }
+    },
+    { 
+      name: "write_file", 
+      description: "Write full content to a file (overwrites existing).", 
+      inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } 
+    },
+    { 
+      name: "read_file", 
+      description: "Read content of a file.", 
       inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } 
     },
     { 
@@ -54,28 +75,13 @@ class MCPManager {
         await this.client.connect(this.transport);
         console.log("✅ [MCP] Server Connected!");
     } catch (e) {
-        console.error("❌ [MCP] Connection Failed:", e);
+        console.warn("⚠️ [MCP] Connection Failed. Using local fallback for file operations.", e);
         this.client = null;
     }
   }
 
   async listTools() {
-    if (!this.client) await this.connect(this.currentRoot || process.cwd()); 
-    if (!this.client) return []; 
-    
-    let fileTools: any[] = [];
-    try {
-        const result = await (this.client as any).request(
-            { method: "tools/list" },
-            { parse: (data: any) => data } 
-        );
-        fileTools = result?.tools || [];
-    } catch (error) {}
-
-    const allTools = [...fileTools, ...this.customTools];
-    const uniqueTools = Array.from(new Map(allTools.map(tool => [tool.name, tool])).values());
-
-    return uniqueTools;
+    return this.customTools;
   }
 
   async callTool(name: string, args: any) {
@@ -94,9 +100,10 @@ class MCPManager {
             let finalContent = args.content;
             
             if (name === "edit_file") {
+                if (!fs.existsSync(fullPath)) throw new Error(`File not found: ${args.path}. Use 'search_files' to find the correct path.`);
                 const content = fs.readFileSync(fullPath, "utf-8");
                 finalContent = applySearchReplace(content, args.search, args.replace);
-                if (!finalContent) throw new Error(`Search block not found in ${args.path}.`);
+                if (!finalContent) throw new Error(`Search block not found in ${args.path}. Ensure whitespace matches.`);
             }
             
             fs.writeFileSync(fullPath, finalContent, "utf-8");
@@ -104,62 +111,85 @@ class MCPManager {
             console.log(`💾 [Disk SUCCESS]: Wrote ${args.path}`);
             return { 
                 success: true, 
-                message: `Successfully wrote to ${args.path}. Verify the content if needed, or proceed to the NEXT file. Do not overwrite this file again with the same content.`
+                content: [{ type: "text", text: `Successfully wrote to ${args.path}.` }]
               };
         } catch (e: any) {
             console.error(`❌ [Disk FAIL]: ${e.message}`);
-            return { success: false, error: `File Operation Failed: ${e.message}` };
+            return { error: `File Operation Failed: ${e.message}` };
         }
     }
 
-    // --- 2. CREATE DIRECTORY ---
-    if (name === "create_directory") {
+    // --- 2. SEARCH FILES (Glob) ---
+    if (name === "search_files") {
         try {
-             const fullPath = getFullPath(args.path);
-             if (!fs.existsSync(fullPath)) {
-                 fs.mkdirSync(fullPath, { recursive: true });
-                 console.log(`📂 [Dir Created]: ${args.path}`);
-                 return { content: [{ type: "text", text: `Created directory: ${args.path}` }] };
-             } else {
-                 return { content: [{ type: "text", text: `Directory exists: ${args.path}` }] };
-             }
+            // Safe glob search ignoring heavy folders
+            // Fixed: Removed 'limit' option and used slice instead
+            const files = await glob(args.pattern, { 
+                cwd: this.currentRoot, 
+                ignore: ["**/node_modules/**", "**/dist/**", "**/.git/**", "**/.next/**"],
+                nodir: true
+            });
+            
+            if (files.length === 0) return { content: [{ type: "text", text: "No files found matching that pattern." }] };
+            
+            // Manually limit results
+            const limitedFiles = files.slice(0, 50);
+            return { content: [{ type: "text", text: `Found files (showing first 50):\n${limitedFiles.join("\n")}` }] };
         } catch (e: any) {
-             return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+            return { error: `Search Error: ${e.message}` };
         }
     }
 
-    // --- 3. EXECUTE COMMAND ---
+    // --- 3. READ / LIST / CREATE (Hybrid Fallback) ---
+    if (name === "read_file" || name === "list_directory" || name === "create_directory") {
+        try {
+            const fullPath = getFullPath(args.path);
+            
+            if (name === "read_file") {
+                if (!fs.existsSync(fullPath)) return { error: `File not found: ${args.path}. Try using 'search_files' to locate it.` };
+                const content = fs.readFileSync(fullPath, "utf-8");
+                return { content: [{ type: "text", text: content }] };
+            }
+            if (name === "list_directory") {
+                if (!fs.existsSync(fullPath)) return { error: `Directory not found: ${args.path}` };
+                const items = fs.readdirSync(fullPath);
+                return { content: [{ type: "text", text: items.join("\n") }] };
+            }
+            if (name === "create_directory") {
+                fs.mkdirSync(fullPath, { recursive: true });
+                return { content: [{ type: "text", text: `Created ${args.path}` }] };
+            }
+        } catch (localErr: any) {
+            return { error: `FS Error: ${localErr.message}` };
+        }
+    }
+
+    // --- 4. EXECUTE COMMAND ---
     if (name === "execute_command") {
         try {
             const { stdout, stderr } = await execAsync(args.command, { cwd: this.currentRoot, maxBuffer: 10 * 1024 * 1024 });
             console.log(`💻 [CMD SUCCESS]: ${args.command}`);
             
-            // Truncate output to prevent context overflow
-            const output = stdout + (stderr ? `\nSTDERR:\n${stderr}` : "");
-            const truncated = output.length > 2000 ? output.substring(0, 2000) + "\n...[Output Truncated]..." : output;
+            const output = (stdout || "") + (stderr ? `\nSTDERR:\n${stderr}` : "");
+            const truncated = output.length > 5000 ? output.substring(0, 5000) + "\n...[Output Truncated]..." : (output || "Success (No Output)");
             
             return { content: [{ type: "text", text: truncated }] };
         } catch (e: any) { 
             console.error(`CMD Failed: ${args.command}`);
-            return { content: [{ type: "text", text: `Command Failed: ${e.message}` }] }; 
+            return { error: `Command Failed: ${e.message}\nStderr: ${e.stderr || ""}` }; 
         }
     }
 
-    // --- 4. READ/LIST (Forward to Server) ---
-    if (!this.client) throw new Error("MCP Client not connected");
-    try {
-      const result = await (this.client as any).request(
-        { method: "tools/call", params: { name, arguments: args } },
-        { parse: (data: any) => data }
-      );
+    if (this.client) {
+        try {
+            return await (this.client as any).request(
+                { method: "tools/call", params: { name, arguments: args } },
+                { parse: (data: any) => data }
+            );
+        } catch (e: any) { return { error: `MCP Forward Error: ${e.message}` }; }
+    }
 
-      if (name === "read_file" && result.content) {
-          const contentStr = result.content.map((c: any) => c.text).join('\n') || '[EMPTY]';
-          console.log(`📖 [Read]: ${args.path} (${contentStr.length} bytes)`);
-      }
-      
-      return result;
-    } catch (error) { throw error; }
+    return { error: `Tool ${name} not found.` };
   }
 }
 

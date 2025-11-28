@@ -106,7 +106,10 @@ export function registerChatStreamHandlers() {
       });
 
       // 5. Create Placeholder Assistant Message
+      // FIX: Read settings fresh here to ensure we capture the toggle state
       const settings = readSettings();
+      const safeSettings = settings as any;
+      
       if (settings.enableDyadPro) dyadRequestId = uuidv4();
 
       const [placeholderAssistantMessage] = await db.insert(messages).values({
@@ -118,7 +121,6 @@ export function registerChatStreamHandlers() {
       }).returning();
 
       // 6. Prepare the LIVE Message List for the UI
-      // We need to fetch the chat again to get the user message we just added + the placeholder
       const updatedChat = await db.query.chats.findFirst({
         where: eq(chats.id, req.chatId),
         with: {
@@ -129,7 +131,6 @@ export function registerChatStreamHandlers() {
 
       if (!updatedChat) throw new Error("Failed to retrieve updated chat");
 
-      // Send initial empty state to UI to show "Thinking..."
       safeSend(event.sender, "chat:response:chunk", {
         chatId: req.chatId,
         messages: updatedChat.messages,
@@ -151,7 +152,9 @@ export function registerChatStreamHandlers() {
         chatId: req.chatId,
         prompt: userPrompt,
         selectedComponents: req.selectedComponents, 
-        attachments: req.attachments
+        attachments: req.attachments,
+        // FIX: Explicitly pass the autoApprove setting
+        autoApprove: safeSettings.autoApproveChanges 
       };
 
       let fullResponseAccumulator = "";
@@ -175,10 +178,10 @@ export function registerChatStreamHandlers() {
             };
         }
 
-        // 3. SEND THE FULL MESSAGE LIST (This fixes the UI bug)
+        // 3. SEND THE FULL MESSAGE LIST
         safeSend(event.sender, "chat:response:chunk", {
           chatId: req.chatId,
-          messages: liveMessages // <--- UI expects this, not 'delta'
+          messages: liveMessages 
         });
 
         // 4. Save to DB occasionally
